@@ -518,7 +518,7 @@ func SetupDir(s *State) bool {
 
 	if s.StatusCodes.Contains(*wildcardResp) {
 		s.IsWildcard = true
-		fmt.Println("[-] Wildcard response found:",fmt.Sprintf("%s%s", s.Url, guid), "=>", *wildcardResp)
+		fmt.Println("[-] Wildcard response found:", fmt.Sprintf("%s%s", s.Url, guid), "=>", *wildcardResp)
 		if !s.WildcardForced {
 			fmt.Println("[-] To force processing of Wildcard responses, specify the '-fw' switch.")
 		}
