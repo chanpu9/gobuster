@@ -15,6 +15,7 @@ package main
 // Please see LICENSE file for license details.
 //
 //----------------------------------------------------
+
 import (
 	"bufio"
 	"crypto/tls"
@@ -67,6 +68,8 @@ type State struct {
 	Extensions     []string
 	FollowRedirect bool
 	IncludeLength  bool
+	HasBatchFile   bool
+	BatchFile      string
 	Mode           string
 	NoStatus       bool
 	Password       string
@@ -75,6 +78,7 @@ type State struct {
 	Processor      ProcessorFunc
 	ProxyUrl       *url.URL
 	Quiet          bool
+	RulerLength    int
 	Setup          SetupFunc
 	ShowIPs        bool
 	StatusCodes    IntSet
@@ -132,6 +136,11 @@ func (set *StringSet) ContainsAny(ss []string) bool {
 	return false
 }
 
+//Clear the set
+func (set *StringSet) Clear() {
+	set.set = map[string]bool{}
+}
+
 // Stringify the set
 func (set *StringSet) Stringify() string {
 	values := []string{}
@@ -152,6 +161,11 @@ func (set *IntSet) Add(i int) bool {
 func (set *IntSet) Contains(i int) bool {
 	_, found := set.set[i]
 	return found
+}
+
+//Clear the set
+func (set *IntSet) Clear() {
+	set.set = map[int]bool{}
 }
 
 // Stringify the set
@@ -228,10 +242,12 @@ func ParseCmdLine() *State {
 	valid := true
 
 	s := State{
-		StatusCodes: IntSet{set: map[int]bool{}},
-		WildcardIps: StringSet{set: map[string]bool{}},
-		IsWildcard:  false,
-		StdIn:       false,
+		StatusCodes:  IntSet{set: map[int]bool{}},
+		WildcardIps:  StringSet{set: map[string]bool{}},
+		IsWildcard:   false,
+		StdIn:        false,
+		HasBatchFile: false,
+		RulerLength:  53,
 	}
 
 	// Set up the variables we're interested in parsing.
@@ -239,6 +255,7 @@ func ParseCmdLine() *State {
 	flag.StringVar(&s.Mode, "m", "dir", "Directory/File mode (dir) or DNS mode (dns)")
 	flag.StringVar(&s.Wordlist, "w", "", "Path to the wordlist")
 	flag.StringVar(&codes, "s", "200,204,301,302,307", "Positive status codes (dir mode only)")
+	flag.StringVar(&s.BatchFile, "b", "", "Batch file containing target URLs or Domains")
 	flag.StringVar(&s.Url, "u", "", "The target URL or Domain")
 	flag.StringVar(&s.Protocol, "pr", "http://", "The target URL's protocol (dir mode only)")
 	flag.StringVar(&s.Cookies, "c", "", "Cookies to use for the requests (dir mode only)")
@@ -280,11 +297,22 @@ func ParseCmdLine() *State {
 		valid = false
 	}
 
-	stdin, err := os.Stdin.Stat()
-	if err != nil {
-		fmt.Println("[!] Unable to stat stdin, falling back to wordlist file.")
-	} else if (stdin.Mode()&os.ModeCharDevice) == 0 && stdin.Size() > 0 {
-		s.StdIn = true
+	if s.BatchFile != "" {
+		s.HasBatchFile = true
+		if _, err := os.Stat(s.BatchFile); os.IsNotExist(err) {
+			fmt.Println("[!] BatchFile (-iL): File does not exist:", s.BatchFile)
+			valid = false
+		}
+	}
+
+	//We can't read all files again from stdin. -iL and stdin aren't compatible
+	if !s.HasBatchFile {
+		stdin, err := os.Stdin.Stat()
+		if err != nil {
+			fmt.Println("[!] Unable to stat stdin, falling back to wordlist file.")
+		} else if (stdin.Mode()&os.ModeCharDevice) == 0 && stdin.Size() > 0 {
+			s.StdIn = true
+		}
 	}
 
 	if !s.StdIn {
@@ -299,21 +327,12 @@ func ParseCmdLine() *State {
 		fmt.Println("[!] Wordlist (-w) specified with pipe from stdin. Can't have both!")
 		valid = false
 	}
-
-	if s.Url == "" {
+	if !s.HasBatchFile && s.Url == "" {
 		fmt.Println("[!] Url/Domain (-u): Must be specified")
 		valid = false
 	}
 
 	if s.Mode == "dir" {
-		if strings.HasSuffix(s.Url, "/") == false {
-			s.Url = s.Url + "/"
-		}
-
-		if strings.HasPrefix(s.Url, "http") == false {
-			s.Url = s.Protocol + s.Url
-		}
-
 		// extensions are comma separated
 		if extensions != "" {
 			s.Extensions = strings.Split(extensions, ",")
@@ -376,18 +395,10 @@ func ParseCmdLine() *State {
 							InsecureSkipVerify: true,
 						},
 					},
-				}}
-
-			code, _ := GoGet(&s, s.Url, "", s.Cookies)
-			if code == nil {
-				fmt.Println("[-] Unable to connect:", s.Url)
-				valid = false
+				},
 			}
-		} else {
-			Ruler(&s)
 		}
 	}
-
 	if valid {
 		return &s
 	}
@@ -397,17 +408,10 @@ func ParseCmdLine() *State {
 
 // Process the busting of the website with the given
 // set of settings from the command line.
-func Process(s *State) {
-
-	ShowConfig(s)
-
+func ProcessSingle(s *State) {
 	if s.Setup(s) == false {
-		Ruler(s)
 		return
 	}
-
-	PrepareSignalHandler(s)
-
 	// channels used for comms
 	wordChan := make(chan string, s.Threads)
 	resultChan := make(chan Result)
@@ -452,8 +456,8 @@ func Process(s *State) {
 
 	var scanner *bufio.Scanner
 
-	if s.StdIn {
-		// Read directly from stdin
+	if !s.HasBatchFile && s.StdIn {
+		// Read directly from stdin, but skip if an Batch file is used
 		scanner = bufio.NewScanner(os.Stdin)
 	} else {
 		// Pull content from the wordlist
@@ -483,10 +487,55 @@ func Process(s *State) {
 	processorGroup.Wait()
 	close(resultChan)
 	printerGroup.Wait()
-	Ruler(s)
+}
+
+func ProcessMultiple(s *State) {
+
+	var scanner *bufio.Scanner
+
+	// Pull targets from Batch file
+	targets, err := os.Open(s.BatchFile)
+	if err != nil {
+		panic("Failed to open BatchFile")
+	}
+	defer targets.Close()
+
+	// Lazy reading of the targets line by line
+	scanner = bufio.NewScanner(targets)
+
+	for scanner.Scan() {
+		if s.Terminate {
+			break
+		}
+		target := strings.TrimSpace(scanner.Text())
+
+		// Skip "comment" (starts with #), as well as empty lines
+		if !strings.HasPrefix(target, "#") && len(target) > 0 {
+			s.Url = target
+			UrlRuler(s)
+			ProcessSingle(s)
+		}
+	}
+}
+
+func UrlExists(s *State) bool {
+	if strings.HasSuffix(s.Url, "/") == false {
+		s.Url = s.Url + "/"
+	}
+
+	if strings.HasPrefix(s.Url, "http") == false {
+		s.Url = "http://" + s.Url
+	}
+	code, _ := GoGet(s, s.Url, "", s.Cookies)
+	if code == nil {
+		return false
+	}
+	return true
 }
 
 func SetupDns(s *State) bool {
+	s.WildcardIps.Clear()
+	s.IsWildcard = false
 	// Resolve a subdomain that probably shouldn't exist
 	guid := uuid.NewV4()
 	wildcardIps, err := net.LookupHost(fmt.Sprintf("%s.%s", guid, s.Url))
@@ -513,6 +562,12 @@ func SetupDns(s *State) bool {
 }
 
 func SetupDir(s *State) bool {
+	if !UrlExists(s) {
+		fmt.Println("[-] Unable to connect:", s.Url)
+		return false
+	}
+	s.IsWildcard = false
+
 	guid := uuid.NewV4()
 	wildcardResp, _ := GoGet(s, s.Url, fmt.Sprintf("%s", guid), s.Cookies)
 
@@ -663,8 +718,14 @@ func (rh *RedirectHandler) RoundTrip(req *http.Request) (resp *http.Response, er
 
 func Ruler(s *State) {
 	if !s.Quiet {
-		fmt.Println("=====================================================")
+		fmt.Println(strings.Repeat("=", s.RulerLength))
 	}
+}
+
+func UrlRuler(s *State) {
+	fmt.Println("")
+	fmt.Println(s.Url)
+	Ruler(s)
 }
 
 func Banner(state *State) {
@@ -684,7 +745,11 @@ func ShowConfig(state *State) {
 
 	if state != nil {
 		fmt.Printf("[+] Mode         : %s\n", state.Mode)
-		fmt.Printf("[+] Url/Domain   : %s\n", state.Url)
+		if state.HasBatchFile {
+			fmt.Printf("[+] Batch file   : %s\n", state.BatchFile)
+		} else {
+			fmt.Printf("[+] Url/Domain   : %s\n", state.Url)
+		}
 		fmt.Printf("[+] Threads      : %d\n", state.Threads)
 
 		wordlist := "stdin (pipe)"
@@ -745,9 +810,23 @@ func ShowConfig(state *State) {
 	}
 }
 
+func ConfigureAndRun(s *State) {
+	ShowConfig(s)
+
+	PrepareSignalHandler(s)
+
+	if !s.HasBatchFile {
+		ProcessSingle(s)
+	} else {
+		ProcessMultiple(s)
+	}
+
+	Ruler(s)
+}
+
 func main() {
 	state := ParseCmdLine()
 	if state != nil {
-		Process(state)
+		ConfigureAndRun(state)
 	}
 }
